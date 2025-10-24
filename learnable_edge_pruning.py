@@ -45,14 +45,16 @@ class learnable_edge_pruning(nn.Module):
         )
         self.temp = 1.0
         
-    def forward(self, node_embed, edge_index, hard=False):
+    def forward(self, node_embed, edge_index, hard=False, return_reg=False):
         """
         Args:
             node_embed: 节点嵌入 [num_nodes, embed_dim]
             edge_index: 边索引 [2, num_edges]
             hard: 是否使用硬采样
+            return_reg: 是否返回L1正则化项
         Returns:
             edge_probs: 边保留概率 [num_edges]
+            l1_reg: L1正则化项（如果return_reg=True）
         """
         row, col = edge_index
         edge_feat = torch.cat([node_embed[row], node_embed[col]], dim=1)
@@ -60,6 +62,11 @@ class learnable_edge_pruning(nn.Module):
         
         # Gumbel-Sigmoid采样
         edge_probs = gumbel_sigmoid(edge_logits, self.temp, hard)
+        
+        if return_reg:
+            # 计算L1正则化项
+            l1_reg = torch.mean(torch.abs(edge_probs))
+            return edge_probs, l1_reg
         
         return edge_probs
     

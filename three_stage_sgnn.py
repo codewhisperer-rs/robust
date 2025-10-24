@@ -25,9 +25,11 @@ class ThreeStageSGNN(nn.Module):
         self.encoder1 = SGCNEncoder(in_channels, hidden_channels)
 
         # Stage 2: Gumbel-Sigmoid
+        # 修复：edge_learner应该接收SGCNEncoder的实际输出维度hidden_channels
         self.edge_learner = learnable_edge_pruning(hidden_channels)
         
         # Stage 3: Refined嵌入
+        # 修复：encoder2应该接收SGCNEncoder的实际输出维度hidden_channels
         self.encoder2 = SGCNEncoder(hidden_channels, hidden_channels)
         
         # 嵌入融合
@@ -72,7 +74,12 @@ class ThreeStageSGNN(nn.Module):
         h1 = self.encoder1(x, edge_index, edge_weight)
 
         # Stage 2: Gumbel-Sigmoid
-        edge_probs = self.edge_learner(h1, edge_index, hard)
+        edge_output = self.edge_learner(h1, edge_index, hard, return_reg=True)
+        if isinstance(edge_output, tuple):
+            edge_probs, l1_reg = edge_output
+        else:
+            edge_probs = edge_output
+            l1_reg = None
         
         # 重加权边：原始符号 × 学习到的概率
         refined_weight = edge_weight * edge_probs
@@ -91,7 +98,7 @@ class ThreeStageSGNN(nn.Module):
         # Stage 3c: 边符号预测
         edge_logits = self.edge_predictor(h_fused, pred_edge_index)
         
-        return edge_logits
+        return (edge_logits, l1_reg) if l1_reg is not None else edge_logits
     
     def _fuse_embeddings(self, h1, h2):
         """

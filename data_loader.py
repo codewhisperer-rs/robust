@@ -7,19 +7,35 @@ def remove_edges(edge_index, edge_weight, edges_to_drop):
     if edge_index.numel() == 0 or edges_to_drop.numel() == 0:
         return edge_index, edge_weight
 
-    if edges_to_drop.dim() != 2:
+    # 确保edges_to_drop是正确的形状 [2, num_edges_to_drop]
+    if edges_to_drop.dim() != 2 or edges_to_drop.size(0) != 2:
         edges_to_drop = edges_to_drop.t().contiguous()
+    
+    # 同样确保edge_index是正确的形状 [2, num_edges]
+    if edge_index.dim() != 2 or edge_index.size(0) != 2:
+        edge_index = edge_index.t().contiguous()
 
-    drop_set = set()
-    for src, dst in edges_to_drop.t().cpu().tolist():
-        drop_set.add((src, dst))
-        drop_set.add((dst, src))
+    # 验证节点ID非负
+    if (edge_index < 0).any() or (edges_to_drop < 0).any():
+        raise ValueError("Node indices must be non-negative")
 
-    keep_mask = []
-    for src, dst in edge_index.t().cpu().tolist():
-        keep_mask.append((src, dst) not in drop_set)
-
-    keep_mask = torch.tensor(keep_mask, dtype=torch.bool, device=edge_index.device)
+    num_nodes = max(edge_index.max().item(), edges_to_drop.max().item()) + 1
+    
+    # 将边转换为唯一的整数标识
+    drop_edge_ids1 = edges_to_drop[0] * num_nodes + edges_to_drop[1]
+    drop_edge_ids2 = edges_to_drop[1] * num_nodes + edges_to_drop[0]
+    drop_edge_ids = torch.cat([drop_edge_ids1, drop_edge_ids2], dim=0)
+    drop_set = torch.unique(drop_edge_ids)
+    
+    # 为现有边创建唯一标识
+    edge_ids1 = edge_index[0] * num_nodes + edge_index[1]
+    edge_ids2 = edge_index[1] * num_nodes + edge_index[0]
+    
+    # 检查每条边是否应该被保留
+    keep_mask1 = ~torch.isin(edge_ids1, drop_set)
+    keep_mask2 = ~torch.isin(edge_ids2, drop_set)
+    keep_mask = keep_mask1 & keep_mask2
+    
     return edge_index[:, keep_mask], edge_weight[keep_mask]
 
 

@@ -1,18 +1,24 @@
 import torch
 import datetime
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
-from sklearn.metrics import f1_score, accuracy_score
+from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
 from three_stage_sgnn import ThreeStageSGNN
 
 
 def compute_metrics(logits, labels):
     preds = torch.argmax(logits, dim=1).cpu().numpy()
     labels = labels.cpu().numpy()
+    
+    # 计算预测概率
+    probs = F.softmax(logits, dim=1).cpu().numpy()
+    
     f1 = f1_score(labels, preds, average='macro', zero_division=0)
     acc = accuracy_score(labels, preds)
-    return f1, acc
+    auc = roc_auc_score(labels, probs[:, 1])
+    return f1, acc, auc
 
 
 def train_single_split(train_data, val_data, test_data, config, device='cpu'):
@@ -30,11 +36,12 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
         weight_decay=config['weight_decay']
     )
     
-    # 类别权重
     class_counts = torch.bincount(train_data.y)
-    class_weights = len(train_data.y) / (2 * class_counts.float())
+    class_weights = torch.sqrt(len(train_data.y) / class_counts.float())
     class_weights = class_weights.to(device)
-    loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+    
+    label_smoothing = config.get('label_smoothing', 0.0)
+    loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
     
     print(f"    类别: 0={class_counts[0]}, 1={class_counts[1]}")
     print(f"    权重: 0={class_weights[0]:.3f}, 1={class_weights[1]:.3f}")
@@ -42,6 +49,9 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
     best_val_f1 = 0
     best_results = {}
     patience_counter = 0
+    
+    # 获取L1正则化权重参数
+    l1_reg_weight = config.get('l1_reg_weight', 0.0)
     
     for epoch in range(config['epochs']):
         if config['use_temp_anneal']:
@@ -53,7 +63,7 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
         model.train()
         optimizer.zero_grad()
         
-        logits = model(
+        output = model(
             train_data.x,
             train_data.edge_index,
             train_data.edge_weight,
@@ -61,35 +71,55 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
             hard=False
         )
         
+        # 处理模型返回值
+        logits = output[0] if isinstance(output, tuple) else output
+        l1_reg = output[1] if isinstance(output, tuple) else None
+            
         loss = loss_fn(logits, train_data.y)
+        
+        # L1正则化项
+        if l1_reg_weight > 0 and l1_reg is not None:
+            loss = loss + l1_reg_weight * l1_reg
+        
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        
+        # 梯度裁剪
+        grad_clip_value = config.get('grad_clip_value', 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)
         optimizer.step()
 
         model.eval()
         with torch.no_grad():
-            val_logits = model(
-                val_data.x, val_data.edge_index, val_data.edge_weight,
-                val_data.pred_edge_index, hard=True
+            val_output = model(
+                val_data.x, 
+                val_data.edge_index, 
+                val_data.edge_weight,
+                val_data.pred_edge_index, 
+                hard=True
             )
-            val_f1, val_acc = compute_metrics(val_logits, val_data.y)
+            val_logits = val_output[0]
+            val_f1, val_acc, val_auc = compute_metrics(val_logits, val_data.y)
             
-            test_logits = model(
-                test_data.x, test_data.edge_index, test_data.edge_weight,
-                test_data.pred_edge_index, hard=True
+            test_output = model(
+                test_data.x, 
+                test_data.edge_index, 
+                test_data.edge_weight,
+                test_data.pred_edge_index, 
+                hard=True
             )
-            test_f1, test_acc = compute_metrics(test_logits, test_data.y)
+            test_logits = test_output[0]
+            test_f1, test_acc, test_auc = compute_metrics(test_logits, test_data.y)
         
         if (epoch + 1) % config['print_every'] == 0:
             print(f"    Epoch {epoch+1:4d} - Loss: {loss.item():.4f} | "
-                  f"Val: F1={val_f1:.4f} ACC={val_acc:.4f} | "
-                  f"Test: F1={test_f1:.4f} ACC={test_acc:.4f}")
+                  f"Val: F1={val_f1:.4f} ACC={val_acc:.4f} AUC={val_auc:.4f} | "
+                  f"Test: F1={test_f1:.4f} ACC={test_acc:.4f} AUC={test_auc:.4f}")
 
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
             best_results = {
-                'val_f1': val_f1, 'val_acc': val_acc,
-                'test_f1': test_f1, 'test_acc': test_acc,
+                'val_f1': val_f1, 'val_acc': val_acc, 'val_auc': val_auc,
+                'test_f1': test_f1, 'test_acc': test_acc, 'test_auc': test_auc,
                 'epoch': epoch + 1
             }
             patience_counter = 0
@@ -101,8 +131,8 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
             break
     
     print(f"    最佳: Epoch {best_results['epoch']} - "
-          f"Val F1={best_results['val_f1']:.4f} ACC={best_results['val_acc']:.4f} | "
-          f"Test F1={best_results['test_f1']:.4f} ACC={best_results['test_acc']:.4f}")
+          f"Val F1={best_results['val_f1']:.4f} ACC={best_results['val_acc']:.4f} AUC={best_results['val_auc']:.4f} | "
+          f"Test F1={best_results['test_f1']:.4f} ACC={best_results['test_acc']:.4f} AUC={best_results['test_auc']:.4f}")
     
     return best_results
 
@@ -141,14 +171,20 @@ def train_all_splits(data_path, config):
         std_test_f1 = np.std([r['test_f1'] for r in results])
         avg_test_acc = np.mean([r['test_acc'] for r in results])
         std_test_acc = np.std([r['test_acc'] for r in results])
+        avg_val_auc = np.mean([r['val_auc'] for r in results])
+        std_val_auc = np.std([r['val_auc'] for r in results])
+        avg_test_auc = np.mean([r['test_auc'] for r in results])
+        std_test_auc = np.std([r['test_auc'] for r in results])
         
         print(f"\n{'='*60}")
         print(f"平均结果 (成功: {len(results)}/{num_splits}):")
         print(f"{'='*60}")
         print(f"验证 F1:  {avg_val_f1:.4f} ± {std_val_f1:.4f}")
         print(f"验证 ACC: {avg_val_acc:.4f} ± {std_val_acc:.4f}")
+        print(f"验证 AUC: {avg_val_auc:.4f} ± {std_val_auc:.4f}")
         print(f"测试 F1:  {avg_test_f1:.4f} ± {std_test_f1:.4f}")
         print(f"测试 ACC: {avg_test_acc:.4f} ± {std_test_acc:.4f}")
+        print(f"测试 AUC: {avg_test_auc:.4f} ± {std_test_auc:.4f}")
         
         
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -172,9 +208,11 @@ def train_all_splits(data_path, config):
             f.write(f"验证集:\n")
             f.write(f"  F1:  {avg_val_f1:.4f} ± {std_val_f1:.4f}\n")
             f.write(f"  ACC: {avg_val_acc:.4f} ± {std_val_acc:.4f}\n")
+            f.write(f"  AUC: {avg_val_auc:.4f} ± {std_val_auc:.4f}\n")
             f.write(f"测试集:\n")
             f.write(f"  F1:  {avg_test_f1:.4f} ± {std_test_f1:.4f}\n")
             f.write(f"  ACC: {avg_test_acc:.4f} ± {std_test_acc:.4f}\n")
+            f.write(f"  AUC: {avg_test_auc:.4f} ± {std_test_auc:.4f}\n")
         
         print(f"\n结果已保存至: {log_filename}")
 
