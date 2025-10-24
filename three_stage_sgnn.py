@@ -25,11 +25,9 @@ class ThreeStageSGNN(nn.Module):
         self.encoder1 = SGCNEncoder(in_channels, hidden_channels)
 
         # Stage 2: Gumbel-Sigmoid
-        # 修复：edge_learner应该接收SGCNEncoder的实际输出维度hidden_channels
         self.edge_learner = learnable_edge_pruning(hidden_channels)
         
         # Stage 3: Refined嵌入
-        # 修复：encoder2应该接收SGCNEncoder的实际输出维度hidden_channels
         self.encoder2 = SGCNEncoder(hidden_channels, hidden_channels)
         
         # 嵌入融合
