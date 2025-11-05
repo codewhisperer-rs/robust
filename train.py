@@ -6,6 +6,7 @@ import torch.optim as optim
 import numpy as np
 from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
 from three_stage_sgnn import ThreeStageSGNN
+from losses import Sign_Product_Entropy_Loss, Sign_Direction_Loss
 
 
 def compute_metrics(logits, labels):
@@ -27,21 +28,43 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
         in_channels=train_data.x.size(1),
         hidden_channels=config['hidden_channels'],
         num_classes=2,
-        fusion=config.get('fusion', 'concat') 
+        fusion=config.get('fusion', 'concat'),
+        encoder_type=config.get('encoder_type', 'sdgnn'),
+        encoder_kwargs=config.get('encoder_kwargs', None),
     ).to(device)
     
-    optimizer = optim.Adam(
-        model.parameters(), 
-        lr=config['lr'], 
-        weight_decay=config['weight_decay']
-    )
-    
+    # class_counts = torch.bincount(train_data.y)
+    # class_weights = len(train_data.y) / (2 * class_counts.float())
     class_counts = torch.bincount(train_data.y)
     class_weights = torch.sqrt(len(train_data.y) / class_counts.float())
     class_weights = class_weights.to(device)
     
     label_smoothing = config.get('label_smoothing', 0.0)
     loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+
+    # Multi-task signed loss modules
+    sign_product_weight = config.get('sign_product_weight', 0.0)
+    sign_direction_weight = config.get('sign_direction_weight', 0.0)
+    sign_product_loss = Sign_Product_Entropy_Loss().to(device) if sign_product_weight > 0 else None
+    sign_direction_loss = Sign_Direction_Loss(emb_dim=config['hidden_channels']).to(device) \
+        if sign_direction_weight > 0 else None
+
+    optim_params = list(model.parameters())
+    if sign_product_loss is not None:
+        optim_params.extend(list(sign_product_loss.parameters()))
+    if sign_direction_loss is not None:
+        optim_params.extend(list(sign_direction_loss.parameters()))
+
+    optimizer = optim.Adam(
+        optim_params,
+        lr=config['lr'],
+        weight_decay=config['weight_decay']
+    )
+
+    pos_mask_train = train_data.edge_weight > 0
+    neg_mask_train = train_data.edge_weight < 0
+    pos_edge_index_train = train_data.edge_index[:, pos_mask_train]
+    neg_edge_index_train = train_data.edge_index[:, neg_mask_train]
     
     print(f"    类别: 0={class_counts[0]}, 1={class_counts[1]}")
     print(f"    权重: 0={class_weights[0]:.3f}, 1={class_weights[1]:.3f}")
@@ -61,6 +84,10 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
             model.set_temp(max(temp, config['temp_end']))
 
         model.train()
+        if sign_product_loss is not None:
+            sign_product_loss.train()
+        if sign_direction_loss is not None:
+            sign_direction_loss.train()
         optimizer.zero_grad()
         
         output = model(
@@ -71,15 +98,26 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
             hard=False
         )
         
-        # 处理模型返回值
-        logits = output[0] if isinstance(output, tuple) else output
-        l1_reg = output[1] if isinstance(output, tuple) else None
+        logits = output['logits']
+        l1_reg = output.get('l1_reg', None)
+        emb_refined = output.get('h2', None)
             
         loss = loss_fn(logits, train_data.y)
         
         # L1正则化项
         if l1_reg_weight > 0 and l1_reg is not None:
             loss = loss + l1_reg_weight * l1_reg
+
+        # 额外的符号监督损失
+        if emb_refined is not None:
+            if sign_product_loss is not None and \
+               pos_edge_index_train.numel() > 0 and neg_edge_index_train.numel() > 0:
+                loss = loss + sign_product_weight * \
+                    sign_product_loss(emb_refined, pos_edge_index_train, neg_edge_index_train)
+            if sign_direction_loss is not None and \
+               pos_edge_index_train.numel() > 0 and neg_edge_index_train.numel() > 0:
+                loss = loss + sign_direction_weight * \
+                    sign_direction_loss(emb_refined, pos_edge_index_train, neg_edge_index_train)
         
         loss.backward()
         
@@ -89,6 +127,10 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
         optimizer.step()
 
         model.eval()
+        if sign_product_loss is not None:
+            sign_product_loss.eval()
+        if sign_direction_loss is not None:
+            sign_direction_loss.eval()
         with torch.no_grad():
             val_output = model(
                 val_data.x, 
@@ -97,7 +139,7 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
                 val_data.pred_edge_index, 
                 hard=True
             )
-            val_logits = val_output[0]
+            val_logits = val_output['logits']
             val_f1, val_acc, val_auc = compute_metrics(val_logits, val_data.y)
             
             test_output = model(
@@ -107,7 +149,7 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
                 test_data.pred_edge_index, 
                 hard=True
             )
-            test_logits = test_output[0]
+            test_logits = test_output['logits']
             test_f1, test_acc, test_auc = compute_metrics(test_logits, test_data.y)
         
         if (epoch + 1) % config['print_every'] == 0:

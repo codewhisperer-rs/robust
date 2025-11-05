@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from sdgnn_encoder import SDGNNEncoder
 from sgcn_encoder import SGCNEncoder
 from learnable_edge_pruning import learnable_edge_pruning
 from edge_predictor import EdgePredictor
@@ -7,28 +8,56 @@ from edge_predictor import EdgePredictor
 
 class ThreeStageSGNN(nn.Module):
     """
-    Stage 1: SGCN学习初始节点嵌入
+    Stage 1: 编码器（SDGNN/SGCN）学习初始节点嵌入
     Stage 2: Gumbel-Sigmoid学习边重要性，重加权边
-    Stage 3: 再次SGCN，拼接/融合嵌入，预测边符号
+    Stage 3: 再次启用编码器，拼接/融合嵌入，预测边符号
     """
-    def __init__(self, in_channels, hidden_channels, num_classes=2, fusion='concat'):
+    def __init__(
+        self,
+        in_channels,
+        hidden_channels,
+        num_classes=2,
+        fusion='concat',
+        encoder_type='sdgnn',
+        encoder_kwargs=None,
+    ):
         """
         Args:
             in_channels: 输入特征维度
             hidden_channels: 隐藏层维度
             num_classes: 分类类别数
             fusion: 嵌入融合方式 ('concat', 'add', 'attention', 'gate')
+            encoder_type: 编码器类型 ('sdgnn' 或 'sgcn')
+            encoder_kwargs: 额外的编码器参数（针对SDGNN）
         """
         super().__init__()
         
+        encoder_type = encoder_type.lower()
+        if encoder_type == 'sdgnn':
+            encoder_cls = SDGNNEncoder
+            self.encoder_kwargs = encoder_kwargs or {}
+        elif encoder_type == 'sgcn':
+            encoder_cls = SGCNEncoder
+            self.encoder_kwargs = {}
+        else:
+            raise ValueError(f"Unknown encoder_type: {encoder_type}")
+
+        self.encoder_type = encoder_type
+
         # Stage 1: 初始节点嵌入
-        self.encoder1 = SGCNEncoder(in_channels, hidden_channels)
+        if self.encoder_type == 'sdgnn':
+            self.encoder1 = encoder_cls(in_channels, hidden_channels, **self.encoder_kwargs)
+        else:
+            self.encoder1 = encoder_cls(in_channels, hidden_channels)
 
         # Stage 2: Gumbel-Sigmoid
         self.edge_learner = learnable_edge_pruning(hidden_channels)
         
         # Stage 3: Refined嵌入
-        self.encoder2 = SGCNEncoder(hidden_channels, hidden_channels)
+        if self.encoder_type == 'sdgnn':
+            self.encoder2 = encoder_cls(hidden_channels, hidden_channels, **self.encoder_kwargs)
+        else:
+            self.encoder2 = encoder_cls(hidden_channels, hidden_channels)
         
         # 嵌入融合
         self.fusion = fusion
@@ -91,14 +120,23 @@ class ThreeStageSGNN(nn.Module):
         h2 = self.encoder2(h1, refined_edge_index, refined_weight)
         
         # Stage 3b: 融合h1和h2
-        h_fused = self._fuse_embeddings(h1, h2)
+        h_fused = self.fuse_embeddings(h1, h2)
         
         # Stage 3c: 边符号预测
         edge_logits = self.edge_predictor(h_fused, pred_edge_index)
-        
-        return (edge_logits, l1_reg) if l1_reg is not None else edge_logits
+
+        return {
+            'logits': edge_logits,
+            'l1_reg': l1_reg,
+            'h1': h1,
+            'h2': h2,
+            'h_fused': h_fused,
+            'edge_probs': edge_probs,
+            'refined_edge_index': refined_edge_index,
+            'refined_weight': refined_weight,
+        }
     
-    def _fuse_embeddings(self, h1, h2):
+    def fuse_embeddings(self, h1, h2):
         """
         融合初始嵌入h1和refined嵌入h2
         
