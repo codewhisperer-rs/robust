@@ -44,8 +44,8 @@ def main():
     parser.add_argument('--label_smoothing', type=float, default=0.0)
     parser.add_argument('--grad_clip_value', type=float, default=1.0)
     parser.add_argument('--model', type=str, default='sdgnn', choices=['sdgnn', 'sgcn'])
-    parser.add_argument('--sign_product_weight', type=float, default=0.0,help='Sign Product Entropy 辅助损失权重')
-    parser.add_argument('--sign_direction_weight', type=float, default=0.0, help='Sign Direction 辅助损失权重')
+    parser.add_argument('--sign_product_weight', type=float, default=0.1,help='Sign Product Entropy 辅助损失权重')
+    parser.add_argument('--sign_direction_weight', type=float, default=0.1, help='Sign Direction 辅助损失权重')
     parser.add_argument('--sdgnn_layers', type=int, default=2)
     parser.add_argument('--sdgnn_heads', type=int, default=1)
     parser.add_argument('--sdgnn_dropout', type=float, default=0.1)
@@ -56,6 +56,7 @@ def main():
     parser.add_argument('--balance_threshold', type=float, default=0.8,help='扩边得分阈值，低于该阈值的候选边会被忽略')
     parser.add_argument('--balance_weighting', type=str, default='sign',choices=['sign', 'score', 'tanh'],help='扩边后新边的权重计算方式')
     parser.add_argument('--balance_symmetrize', action='store_true',help='启用无向图扩边')
+    parser.add_argument('--balance_mode', type=str, default='dense', choices=['dense', 'local'],help='扩边实现：dense 使用矩阵乘法；local 采用局部三角统计（适合大图）')
     parser.add_argument('--disable_balance_expansion', action='store_true',help='禁用结构平衡扩边')
 
     parser.add_argument('--prune_threshold', type=float, default=0.3,help='Gumbel 筛边阶段的权重阈值')
@@ -103,6 +104,7 @@ def main():
             'score_threshold': args.balance_threshold,
             'weighting': args.balance_weighting,
             'symmetrize': args.balance_symmetrize,
+            'mode': args.balance_mode,
         },
         'prune_threshold': args.prune_threshold,
     }
