@@ -1,12 +1,44 @@
-import torch
 import datetime
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
+from decimal import Decimal
+from pathlib import Path
 from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
 from three_stage_sgnn import ThreeStageSGNN
 from losses import Sign_Product_Entropy_Loss, Sign_Direction_Loss
+
+
+def format_ratio(value: float) -> str:
+    out = format(Decimal(str(value)).normalize(), 'f')
+    if '.' in out:
+        out = out.rstrip('0').rstrip('.')
+    return out or '0'
+
+
+def infer_dataset_and_noise(data_path: str):
+    path = Path(data_path)
+    parts = path.parts
+    dataset = None
+    noise = '0'
+
+    if 'processed' in parts:
+        idx = parts.index('processed')
+        if idx + 1 < len(parts):
+            dataset = parts[idx + 1]
+    if dataset is None and len(parts) >= 2:
+        dataset = parts[-2]
+    if dataset is None:
+        dataset = path.stem
+
+    for part in parts:
+        if part.startswith('noise_'):
+            noise = part.split('noise_', 1)[1] or '0'
+            break
+
+    return dataset, noise
 
 
 def compute_metrics(logits, labels):
@@ -31,6 +63,8 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
         fusion=config.get('fusion', 'concat'),
         encoder_type=config.get('encoder_type', 'sdgnn'),
         encoder_kwargs=config.get('encoder_kwargs', None),
+        balance_config=config.get('balance_expander', None),
+        prune_threshold=config.get('prune_threshold', 1e-3),
     ).to(device)
     
     # class_counts = torch.bincount(train_data.y)
@@ -179,7 +213,7 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
     return best_results
 
 
-def train_all_splits(data_path, config):
+def train_all_splits(data_path, config, dataset_name=None, noise_ratio=None, results_dir='results'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"使用设备: {device}\n")
     
@@ -230,7 +264,21 @@ def train_all_splits(data_path, config):
         
         
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_filename = f'results_{timestamp}.txt'
+        results_path = Path(results_dir)
+        results_path.mkdir(parents=True, exist_ok=True)
+
+        if dataset_name:
+            dataset_label = dataset_name
+            inferred_noise = None
+        else:
+            dataset_label, inferred_noise = infer_dataset_and_noise(data_path)
+
+        if noise_ratio is not None:
+            noise_label = format_ratio(noise_ratio)
+        else:
+            noise_label = inferred_noise or '0'
+
+        log_filename = results_path / f"{dataset_label}-{noise_label}-{timestamp}.txt"
         
         with open(log_filename, 'w') as f:
             f.write(f"训练时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -257,22 +305,3 @@ def train_all_splits(data_path, config):
             f.write(f"  AUC: {avg_test_auc:.4f} ± {std_test_auc:.4f}\n")
         
         print(f"\n结果已保存至: {log_filename}")
-
-
-if __name__ == '__main__':
-    config = {
-        'hidden_channels': 64,
-        'epochs': 1000,
-        'lr': 0.001,
-        'weight_decay': 1e-3,
-        'patience': 100,
-        'print_every': 25,
-        'use_temp_anneal': True,
-        'temp_start': 3.0,
-        'temp_end': 0.5,
-        'fusion': 'concat',  # 'concat', 'add', 'attention', 'gate'
-    }
-
-    data_path = '/home/houyikang/data/processed/slashdot/random_masking/seed_0_num_splits_20/test_0.05_val_0.05/mask_0.75/unlabeled_0.5/signed_datasets.pkl'
-
-    train_all_splits(data_path, config)
