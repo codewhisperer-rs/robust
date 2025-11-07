@@ -27,8 +27,8 @@ def main():
     parser = argparse.ArgumentParser()
     # 数据集参数
     parser.add_argument('--data_root', type=str, default='/home/houyikang/data/processed')
-    parser.add_argument('--dataset_name', type=str, default='slashdot')
-    parser.add_argument('--noise_ratio', type=float, default=0.0)
+    parser.add_argument('--dataset_name', type=str, default='bitcoin_alpha')
+    parser.add_argument('--noise_ratio', type=float, default=0.1)
     parser.add_argument('--unlabeled_ratio', type=float, default=0)
     parser.add_argument('--data_path', type=str, default=None,help='提供该路径，将覆盖自动构建的路径')
 
@@ -44,8 +44,8 @@ def main():
     parser.add_argument('--label_smoothing', type=float, default=0.0)
     parser.add_argument('--grad_clip_value', type=float, default=1.0)
     parser.add_argument('--model', type=str, default='sdgnn', choices=['sdgnn', 'sgcn'])
-    parser.add_argument('--sign_product_weight', type=float, default=0.1,help='Sign Product Entropy 辅助损失权重')
-    parser.add_argument('--sign_direction_weight', type=float, default=0.1, help='Sign Direction 辅助损失权重')
+    parser.add_argument('--sign_product_weight', type=float, default=0.0,help='Sign Product Entropy 辅助损失权重')
+    parser.add_argument('--sign_direction_weight', type=float, default=0.0, help='Sign Direction 辅助损失权重')
     parser.add_argument('--sdgnn_layers', type=int, default=2)
     parser.add_argument('--sdgnn_heads', type=int, default=1)
     parser.add_argument('--sdgnn_dropout', type=float, default=0.1)

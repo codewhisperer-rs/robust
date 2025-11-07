@@ -23,7 +23,7 @@ class ThreeStageSGNN(nn.Module):
         encoder_type='sdgnn',
         encoder_kwargs=None,
         balance_config=None,
-        prune_threshold=1e-3,
+        prune_threshold=0.5,
     ):
         """
         Args:

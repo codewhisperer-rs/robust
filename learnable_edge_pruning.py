@@ -39,7 +39,12 @@ class learnable_edge_pruning(nn.Module):
         edge_feat = torch.cat([node_embed[row], node_embed[col]], dim=1)
         edge_logits = self.edge_scorer(edge_feat).squeeze(-1)
 
-        edge_probs = gumbel_sigmoid(edge_logits, self.temp, hard)
+        edge_probs = gumbel_sigmoid(
+            edge_logits,
+            temp=self.temp,
+            hard=hard,
+            threshold=self.edge_threshold,
+        )
 
         if return_reg:
             l1_reg = torch.mean(torch.abs(edge_probs))
