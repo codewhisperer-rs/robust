@@ -47,9 +47,7 @@ class learnable_edge_pruning(nn.Module):
         )
 
         if return_reg:
-            l1_reg = torch.mean(torch.abs(edge_probs))
-            return edge_probs, l1_reg
-
+            return edge_probs, None
         return edge_probs
 
     def set_temp(self, temp):

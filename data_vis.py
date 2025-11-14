@@ -2,7 +2,7 @@ import pickle
 import torch
 
 # 读取数据
-with open('/data/processed/bitcoin_alpha/random_masking/seed_0_num_splits_20/test_0.05_val_0.05/mask_0.75/signed_datasets.pkl', 'rb') as f:
+with open('/home/houyikang/data/processed/bitcoin_alpha/random_masking/noise_0.1/seed_0_num_splits_20/test_0.05_val_0.05/mask_0.75/signed_datasets.pkl', 'rb') as f:
     data = pickle.load(f)
 
 # 获取第一个数据集
@@ -43,16 +43,16 @@ if dataset:
     train_edges = dataset.get('train', {}).get('edges', None)
     train_labels = dataset.get('train', {}).get('label', None)
 
-    print("训练集边：", train_edges[:5] if train_edges is not None else "无数据")
-    print("训练集标签：", train_labels[:5] if train_labels is not None else "无数据")
+    print("训练集边：", train_edges[-5:-1] if train_edges is not None else "无数据")
+    print("训练集标签：", train_labels[-5:-1] if train_labels is not None else "无数据")
     print("训练集边数量：", train_edges.size(0) if train_edges is not None else "无数据")
 
     # 获取验证集数据
     val_edges = dataset.get('val', {}).get('edges', None)
     val_labels = dataset.get('val', {}).get('label', None)
 
-    print("验证集边：", val_edges[:5] if val_edges is not None else "无数据")
-    print("验证集标签：", val_labels[:5] if val_labels is not None else "无数据")
+    print("验证集边：", val_edges[-5:-1] if val_edges is not None else "无数据")
+    print("验证集标签：", val_labels[-5:-1] if val_labels is not None else "无数据")
     print("验证集边数量：", val_edges.size(0) if val_edges is not None else "无数据")
 
     # 获取测试集数据

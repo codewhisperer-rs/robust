@@ -73,8 +73,7 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
     class_weights = torch.sqrt(len(train_data.y) / class_counts.float())
     class_weights = class_weights.to(device)
     
-    label_smoothing = config.get('label_smoothing', 0.0)
-    loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+    loss_fn = nn.CrossEntropyLoss(weight=class_weights)
 
     # Multi-task signed loss modules
     sign_product_weight = config.get('sign_product_weight', 0.0)
@@ -103,12 +102,9 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
     print(f"    类别: 0={class_counts[0]}, 1={class_counts[1]}")
     print(f"    权重: 0={class_weights[0]:.3f}, 1={class_weights[1]:.3f}")
     
-    best_val_f1 = 0
+    best_val_score = float('-inf')
     best_results = {}
     patience_counter = 0
-    
-    # 获取L1正则化权重参数
-    l1_reg_weight = config.get('l1_reg_weight', 0.0)
     
     for epoch in range(config['epochs']):
         if config['use_temp_anneal']:
@@ -133,14 +129,9 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
         )
         
         logits = output['logits']
-        l1_reg = output.get('l1_reg', None)
         emb_refined = output.get('h2', None)
             
         loss = loss_fn(logits, train_data.y)
-        
-        # L1正则化项
-        if l1_reg_weight > 0 and l1_reg is not None:
-            loss = loss + l1_reg_weight * l1_reg
 
         # 额外的符号监督损失
         if emb_refined is not None:
@@ -191,8 +182,9 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
                   f"Val: F1={val_f1:.4f} ACC={val_acc:.4f} AUC={val_auc:.4f} | "
                   f"Test: F1={test_f1:.4f} ACC={test_acc:.4f} AUC={test_auc:.4f}")
 
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
+        val_score = val_f1
+        if val_score > best_val_score:
+            best_val_score = val_score
             best_results = {
                 'val_f1': val_f1, 'val_acc': val_acc, 'val_auc': val_auc,
                 'test_f1': test_f1, 'test_acc': test_acc, 'test_auc': test_auc,
