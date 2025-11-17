@@ -9,10 +9,10 @@ from structural_balance_expansion import StructuralBalanceExpander
 
 class ThreeStageSGNN(nn.Module):
     """
-    Stage 1: 使用原始图编码初始节点嵌入
-    Stage 2: 结构平衡扩边仅生成候选边
-    Stage 3: Gumbel-Sigmoid基于h1筛选候选边
-    Stage 4: 合并筛选后的新边后再次编码并预测
+    Stage 1: 使用原始图编码初始节点嵌入 (h1)
+    Stage 2: 结构平衡扩边生成 完整候选图(原始边 + 新增边)
+    Stage 3: Gumbel-Sigmoid 基于h1共同训练，筛选完整候选图
+    Stage 4: 在精炼图上再次编码 (h2)，融合 (h1, h2) 并预测
     """
 
     def __init__(
@@ -43,20 +43,21 @@ class ThreeStageSGNN(nn.Module):
         balance_args = dict(balance_config) if balance_config else {}
         balance_enabled = balance_args.pop('enabled', True)
         if balance_enabled:
+            # Stage 2: 结构平衡扩边器，仅提供候选边
             self.balance_expander = StructuralBalanceExpander(**balance_args)
         else:
             self.balance_expander = None
 
-        # Stage 2: 初始节点嵌入
+        # Stage 1: 原图编码器
         if self.encoder_type == 'sdgnn':
             self.encoder1 = encoder_cls(in_channels, hidden_channels, **self.encoder_kwargs)
         else:
             self.encoder1 = encoder_cls(in_channels, hidden_channels)
 
-        # Stage 3: Gumbel-Sigmoid
+        # Stage 3: Gumbel-Sigmoid候选边筛选器
         self.edge_learner = learnable_edge_pruning(hidden_channels, edge_threshold=prune_threshold)
 
-        # Stage 4: Refined嵌入
+        # Stage 4: 合并后图上的第二次编码
         if self.encoder_type == 'sdgnn':
             self.encoder2 = encoder_cls(hidden_channels, hidden_channels, **self.encoder_kwargs)
         else:
@@ -105,51 +106,38 @@ class ThreeStageSGNN(nn.Module):
         edge_weight = edge_weight.to(x.dtype)
         h1 = self.encoder1(x, edge_index, edge_weight)
 
-        # Stage 2: 仅生成候选扩边
+        # Stage 2: 生成完整候选图（原始边 + 新增边）
         if self.balance_expander is not None:
             expanded_edge_index, expanded_edge_weight, balance_stats = self.balance_expander(
                 edge_index, edge_weight, num_nodes
             )
-            new_edge_index = balance_stats.get(
-                'new_edge_index',
-                edge_index.new_empty((2, 0)),
-            )
-            new_edge_weight = balance_stats.get(
-                'new_edge_weight',
-                edge_weight.new_empty(0),
-            )
+            balance_stats = dict(balance_stats)
         else:
             expanded_edge_index, expanded_edge_weight = edge_index, edge_weight
-            new_edge_index = edge_index.new_empty((2, 0))
-            new_edge_weight = edge_weight.new_empty(0)
             balance_stats = {
                 'num_new_edges': 0,
-                'new_edge_index': new_edge_index,
-                'new_edge_weight': new_edge_weight,
+                'new_edge_index': edge_index.new_empty((2, 0)),
+                'new_edge_weight': edge_weight.new_empty(0),
             }
 
         expanded_edge_weight = expanded_edge_weight.to(x.dtype)
-        new_edge_weight = new_edge_weight.to(x.dtype)
 
-        # Stage 3: 仅对候选扩边执行Gumbel筛选
-        if new_edge_index.size(1) > 0:
-            edge_probs = self.edge_learner(h1, new_edge_index, hard, return_reg=False)
-            refined_new_weight = new_edge_weight * edge_probs
-            mask = refined_new_weight.abs() > self.edge_threshold
-            pruned_edge_index = new_edge_index[:, mask]
-            pruned_edge_weight = refined_new_weight[mask]
+        # Stage 3: 用h1共同训练筛选器
+        edge_output = self.edge_learner(h1, expanded_edge_index, hard, return_reg=True)
+        if isinstance(edge_output, tuple):
+            edge_probs, l1_reg = edge_output
         else:
-            edge_probs = h1.new_empty(0)
-            pruned_edge_index = new_edge_index
-            pruned_edge_weight = new_edge_weight
+            edge_probs = edge_output
+            l1_reg = None
+        refined_weight = expanded_edge_weight * edge_probs
+        mask = refined_weight.abs() > self.edge_threshold
+        refined_edge_index = expanded_edge_index[:, mask]
+        refined_weight = refined_weight[mask]
 
-        # Stage 4a: 将筛选后的扩边与原图合并，再次编码
-        if pruned_edge_index.size(1) > 0:
-            refined_edge_index = torch.cat([edge_index, pruned_edge_index], dim=1)
-            refined_weight = torch.cat([edge_weight, pruned_edge_weight], dim=0)
-        else:
-            refined_edge_index = edge_index
-            refined_weight = edge_weight
+        candidate_count = expanded_edge_index.size(1)
+        retained_count = refined_edge_index.size(1)
+        balance_stats['num_candidate_edges'] = candidate_count
+        balance_stats['num_retained_edges'] = retained_count
 
         h2 = self.encoder2(h1, refined_edge_index, refined_weight)
 
@@ -161,6 +149,7 @@ class ThreeStageSGNN(nn.Module):
 
         return {
             'logits': edge_logits,
+            'l1_reg': l1_reg,
             'h1': h1,
             'h2': h2,
             'h_fused': h_fused,
@@ -192,21 +181,24 @@ class ThreeStageSGNN(nn.Module):
             raise ValueError(f"Unknown fusion: {self.fusion}")
 
     def get_edge_probs(self, x, edge_index, edge_weight):
-        """获取候选扩边在Gumbel筛选前的概率"""
+        """获取完整候选图在Gumbel筛选前的概率"""
         with torch.no_grad():
             edge_weight = edge_weight.to(x.dtype)
             h1 = self.encoder1(x, edge_index, edge_weight)
 
             if self.balance_expander is not None:
-                _, _, stats = self.balance_expander(edge_index, edge_weight, x.size(0))
-                candidate_edge_index = stats.get('new_edge_index', edge_index.new_empty((2, 0)))
+                expanded_edge_index, _, _ = self.balance_expander(edge_index, edge_weight, x.size(0))
             else:
-                candidate_edge_index = edge_index.new_empty((2, 0))
+                expanded_edge_index = edge_index
 
-            if candidate_edge_index.size(1) == 0:
+            if expanded_edge_index.size(1) == 0:
                 return h1.new_empty(0)
 
-            edge_probs = self.edge_learner(h1, candidate_edge_index, hard=False)
+            edge_output = self.edge_learner(h1.detach(), expanded_edge_index, hard=False, return_reg=True)
+            if isinstance(edge_output, tuple):
+                edge_probs, _ = edge_output
+            else:
+                edge_probs = edge_output
         return edge_probs
 
     def set_temp(self, temp):

@@ -1,2 +1,6 @@
 __pycache__/
 results_*.txt
+results/
+grid_search.py
+gs_*.json
+.gitignore

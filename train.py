@@ -127,8 +127,14 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
             train_data.pred_edge_index,
             hard=False
         )
+
+        balance_stats = output.get('balance_stats', {}) or {}
+        num_candidates = balance_stats.get('num_candidate_edges', balance_stats.get('num_new_edges', 0))
+        num_retained = balance_stats.get('num_retained_edges', 0)
         
         logits = output['logits']
+        l1_reg = output.get('l1_reg', None)
+        edge_probs = output.get('edge_probs', None)
         emb_refined = output.get('h2', None)
             
         loss = loss_fn(logits, train_data.y)
@@ -143,6 +149,14 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
                pos_edge_index_train.numel() > 0 and neg_edge_index_train.numel() > 0:
                 loss = loss + sign_direction_weight * \
                     sign_direction_loss(emb_refined, pos_edge_index_train, neg_edge_index_train)
+
+        # Gumbel 概率的 L1 稀疏约束
+        l1_reg_weight = config.get('l1_reg_weight', 0.0)
+        if l1_reg_weight > 0:
+            if l1_reg is None and edge_probs is not None and edge_probs.numel() > 0:
+                l1_reg = edge_probs.abs().mean()
+            if l1_reg is not None:
+                loss = loss + l1_reg_weight * l1_reg
         
         loss.backward()
         
@@ -177,10 +191,11 @@ def train_single_split(train_data, val_data, test_data, config, device='cpu'):
             test_logits = test_output['logits']
             test_f1, test_acc, test_auc = compute_metrics(test_logits, test_data.y)
         
-        if (epoch + 1) % config['print_every'] == 0:
+        if epoch == 0 or (epoch + 1) % config['print_every'] == 0:
             print(f"    Epoch {epoch+1:4d} - Loss: {loss.item():.4f} | "
                   f"Val: F1={val_f1:.4f} ACC={val_acc:.4f} AUC={val_auc:.4f} | "
-                  f"Test: F1={test_f1:.4f} ACC={test_acc:.4f} AUC={test_auc:.4f}")
+                  f"Test: F1={test_f1:.4f} ACC={test_acc:.4f} AUC={test_auc:.4f} | "
+                  f"Expand {num_candidates} -> {num_retained}")
 
         val_score = val_f1
         if val_score > best_val_score:
@@ -253,6 +268,28 @@ def train_all_splits(data_path, config, dataset_name=None, noise_ratio=None, res
         print(f"测试 F1:  {avg_test_f1:.4f} ± {std_test_f1:.4f}")
         print(f"测试 ACC: {avg_test_acc:.4f} ± {std_test_acc:.4f}")
         print(f"测试 AUC: {avg_test_auc:.4f} ± {std_test_auc:.4f}")
+
+        summary = {
+            'dataset': dataset_name or dataset_label,
+            'noise_ratio': noise_ratio if noise_ratio is not None else float(noise_label),
+            'num_splits': num_splits,
+            'num_success': len(results),
+            'averages': {
+                'val_f1': avg_val_f1,
+                'val_f1_std': std_val_f1,
+                'val_acc': avg_val_acc,
+                'val_acc_std': std_val_acc,
+                'val_auc': avg_val_auc,
+                'val_auc_std': std_val_auc,
+                'test_f1': avg_test_f1,
+                'test_f1_std': std_test_f1,
+                'test_acc': avg_test_acc,
+                'test_acc_std': std_test_acc,
+                'test_auc': avg_test_auc,
+                'test_auc_std': std_test_auc,
+            },
+            'per_split': results,
+        }
         
         
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -296,4 +333,9 @@ def train_all_splits(data_path, config, dataset_name=None, noise_ratio=None, res
             f.write(f"  ACC: {avg_test_acc:.4f} ± {std_test_acc:.4f}\n")
             f.write(f"  AUC: {avg_test_auc:.4f} ± {std_test_auc:.4f}\n")
         
+        summary['log_path'] = str(log_filename)
         print(f"\n结果已保存至: {log_filename}")
+        return summary
+    
+    print("\n没有成功的划分，跳过记录。")
+    return None
