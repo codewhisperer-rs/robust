@@ -1,37 +1,31 @@
 from collections import defaultdict
 import torch
 from torch import Tensor
+from torch_sparse import SparseTensor  
+from typing import Dict, Any
 
 
 class StructuralBalanceExpander:
     """
-    基于结构平衡理论扩张有向符号图。提供两种实现：
-    - dense：使用邻接矩阵乘法统计三角关系，精度高但显存消耗大；
-    - local：仅遍历二跳邻居的三角关系，适合 Slashdot 等大规模图。
+    基于结构平衡理论扩张有向符号图。
+    支持三种模式：
+        - 'dense' : 传统矩阵乘法，适合 < 20k 节点
+        - 'sparse': 稀疏矩阵乘法实现
     """
 
     def __init__(
         self,
         top_k_per_node: int | None = 20,
         score_threshold: float = 1.0,
-        weighting: str = 'sign',
+        weighting: str = 'sign',       # 'sign' / 'score' / 'tanh'
         symmetrize: bool = False,
         allow_self_loops: bool = False,
-        mode: str = 'dense',
+        mode: str = 'sparse',           # 默认推荐 sparse！
     ) -> None:
-        """
-        Args:
-            top_k_per_node: 每个源节点保留的扩张边上限，<=0 表示不过滤
-            score_threshold: 候选边得分的绝对值下限
-            weighting: 新边权重的计算方式：sign / score / tanh
-            symmetrize: 是否对扩张边做对称化（无向化）
-            allow_self_loops: 是否保留自环
-            mode: 'dense' | 'local'
-        """
         if weighting not in {'sign', 'score', 'tanh'}:
             raise ValueError(f"Unsupported weighting strategy: {weighting}")
-        if mode not in {'dense', 'local'}:
-            raise ValueError(f"Unsupported expansion mode: {mode}")
+        if mode not in {'dense', 'local', 'sparse'}:
+            raise ValueError(f"Unsupported mode: {mode}")
 
         self.top_k_per_node = None if top_k_per_node is None or top_k_per_node <= 0 else int(top_k_per_node)
         self.score_threshold = float(score_threshold)
@@ -48,17 +42,21 @@ class StructuralBalanceExpander:
     def expand(self, edge_index: Tensor, edge_weight: Tensor, num_nodes: int):
         if edge_index.numel() == 0:
             device = edge_index.device
+            empty_idx = torch.empty((2, 0), dtype=torch.long, device=device)
+            empty_w = torch.empty((0,), dtype=edge_weight.dtype, device=device)
             return edge_index, edge_weight, {
                 'num_new_edges': 0,
-                'new_edge_index': torch.empty((2, 0), dtype=torch.long, device=device),
-                'new_edge_weight': torch.empty((0,), dtype=edge_weight.dtype, device=device),
+                'new_edge_index': empty_idx,
+                'new_edge_weight': empty_w,
             }
 
         if self.mode == 'dense':
             return self.dense_expand(edge_index, edge_weight, num_nodes)
-        return self.local_expand(edge_index, edge_weight, num_nodes)
+        elif self.mode == 'local':
+            return self.local_expand(edge_index, edge_weight, num_nodes)
+        else:  # 'sparse'
+            return self.sparse_expand(edge_index, edge_weight, num_nodes)
 
-   
     def dense_expand(self, edge_index: Tensor, edge_weight: Tensor, num_nodes: int):
         device = edge_index.device
         dtype = torch.float32
@@ -105,11 +103,9 @@ class StructuralBalanceExpander:
 
         candidate_mask &= ~existing_mask
         if not candidate_mask.any():
-            return edge_index, edge_weight, {
-                'num_new_edges': 0,
-                'new_edge_index': torch.empty((2, 0), dtype=torch.long, device=device),
-                'new_edge_weight': torch.empty((0,), dtype=dtype, device=device),
-            }
+            empty_idx = torch.empty((2, 0), dtype=torch.long, device=device)
+            empty_w = torch.empty((0,), dtype=dtype, device=device)
+            return edge_index, edge_weight, {'num_new_edges': 0, 'new_edge_index': empty_idx, 'new_edge_weight': empty_w}
 
         rows, cols = candidate_mask.nonzero(as_tuple=True)
         candidate_scores = score[rows, cols]
@@ -122,20 +118,17 @@ class StructuralBalanceExpander:
 
         if not self.allow_self_loops:
             non_diag = rows != cols
-            rows = rows[non_diag]
-            cols = cols[non_diag]
-            weights = weights[non_diag]
+            rows, cols, weights = rows[non_diag], cols[non_diag], weights[non_diag]
 
         if rows.numel() == 0:
-            return edge_index, edge_weight, {
-                'num_new_edges': 0,
-                'new_edge_index': torch.empty((2, 0), dtype=torch.long, device=device),
-                'new_edge_weight': torch.empty((0,), dtype=dtype, device=device),
-            }
+            empty_idx = torch.empty((2, 0), dtype=torch.long, device=device)
+            empty_w = torch.empty((0,), dtype=dtype, device=device)
+            return edge_index, edge_weight, {'num_new_edges': 0, 'new_edge_index': empty_idx, 'new_edge_weight': empty_w}
 
         new_edge_index = torch.stack([rows, cols], dim=0)
         new_edge_weight = weights
 
+        # 去重
         if new_edge_index.size(1) > 1:
             linear_idx = new_edge_index[0] * num_nodes + new_edge_index[1]
             linear_idx, perm = torch.sort(linear_idx)
@@ -155,138 +148,150 @@ class StructuralBalanceExpander:
             'new_edge_weight': new_edge_weight,
         }
 
-    def local_expand(self, edge_index: Tensor, edge_weight: Tensor, num_nodes: int):
+    @torch.no_grad()
+    def sparse_expand(self, edge_index: Tensor, edge_weight: Tensor, num_nodes: int):
         device = edge_index.device
-        edge_index_cpu = edge_index.detach().cpu()
-        edge_weight_cpu = edge_weight.detach().cpu()
 
-        pos_out = [set() for _ in range(num_nodes)]
-        neg_out = [set() for _ in range(num_nodes)]
-        existing_edges = set()
+        pos_mask = edge_weight > 0
+        neg_mask = ~pos_mask
 
-        for idx in range(edge_index_cpu.size(1)):
-            src = int(edge_index_cpu[0, idx])
-            dst = int(edge_index_cpu[1, idx])
-            existing_edges.add((src, dst))
-            if edge_weight_cpu[idx] > 0:
-                pos_out[src].add(dst)
-            elif edge_weight_cpu[idx] < 0:
-                neg_out[src].add(dst)
+        pos_edge = edge_index[:, pos_mask]
+        neg_edge = edge_index[:, neg_mask]
 
-        score_map = defaultdict(int)
+        # 极端情况：只有正边或只有负边
+        if pos_edge.size(1) == 0 or neg_edge.size(1) == 0:
+            empty_idx = torch.empty((2, 0), dtype=torch.long, device=device)
+            empty_w = torch.empty((0,), dtype=edge_weight.dtype, device=device)
+            return edge_index, edge_weight, {
+                'num_new_edges': 0,
+                'new_edge_index': empty_idx,
+                'new_edge_weight': empty_w,
+            }
 
-        for src in range(num_nodes):
-            pos_neighbors = pos_out[src]
-            neg_neighbors = neg_out[src]
+        pos_adj = SparseTensor.from_edge_index(pos_edge, sparse_sizes=(num_nodes, num_nodes)).to(device)
+        neg_adj = SparseTensor.from_edge_index(neg_edge, sparse_sizes=(num_nodes, num_nodes)).to(device)
 
-            for mid in pos_neighbors:
-                pos_mid = pos_out[mid]
-                neg_mid = neg_out[mid]
+        # 四种二跳路径计数
+        pp = pos_adj @ pos_adj   # ++ → +
+        nn = neg_adj @ neg_adj   # -- → +
+        pn = pos_adj @ neg_adj   # +- → -
+        np = neg_adj @ pos_adj   # -+ → -
 
-                for dst in pos_mid:
-                    if not self.allow_self_loops and dst == src:
-                        continue
-                    if (src, dst) in existing_edges:
-                        continue
-                    score_map[(src, dst)] += 1
+        score_map = defaultdict(float)
 
-                for dst in neg_mid:
-                    if not self.allow_self_loops and dst == src:
-                        continue
-                    if (src, dst) in existing_edges:
-                        continue
-                    score_map[(src, dst)] -= 1
+        # 平衡三角形贡献 +1
+        r, c, _ = pp.coo()
+        for ri, ci in zip(r.tolist(), c.tolist()):
+            score_map[(ri, ci)] += 1.0
+        r, c, _ = nn.coo()
+        for ri, ci in zip(r.tolist(), c.tolist()):
+            score_map[(ri, ci)] += 1.0
 
-            for mid in neg_neighbors:
-                pos_mid = pos_out[mid]
-                neg_mid = neg_out[mid]
+        # 非平衡三角形贡献 -1
+        r, c, _ = pn.coo()
+        for ri, ci in zip(r.tolist(), c.tolist()):
+            score_map[(ri, ci)] -= 1.0
+        r, c, _ = np.coo()
+        for ri, ci in zip(r.tolist(), c.tolist()):
+            score_map[(ri, ci)] -= 1.0
 
-                for dst in neg_mid:
-                    if not self.allow_self_loops and dst == src:
-                        continue
-                    if (src, dst) in existing_edges:
-                        continue
-                    score_map[(src, dst)] += 1
+        if not score_map:
+            empty_idx = torch.empty((2, 0), dtype=torch.long, device=device)
+            empty_w = torch.empty((0,), dtype=edge_weight.dtype, device=device)
+            return edge_index, edge_weight, {
+                'num_new_edges': 0,
+                'new_edge_index': empty_idx,
+                'new_edge_weight': empty_w,
+            }
 
-                for dst in pos_mid:
-                    if not self.allow_self_loops and dst == src:
-                        continue
-                    if (src, dst) in existing_edges:
-                        continue
-                    score_map[(src, dst)] -= 1
-
-        per_src = defaultdict(list)
-        threshold = self.score_threshold
-        for (src, dst), score in score_map.items():
-            if score == 0:
+        rows, cols, scores = [], [], []
+        for (ri, ci), sv in score_map.items():
+            if sv == 0:
                 continue
-            if threshold > 0 and abs(score) < threshold:
-                continue
-            per_src[src].append((score, dst))
-
-        rows = []
-        cols = []
-        scores = []
-
-        for src, pairs in per_src.items():
-            if not pairs:
-                continue
-            if self.top_k_per_node is not None and len(pairs) > self.top_k_per_node:
-                pairs.sort(key=lambda x: abs(x[0]), reverse=True)
-                pairs = pairs[:self.top_k_per_node]
-            for score, dst in pairs:
-                if not self.allow_self_loops and src == dst:
-                    continue
-                if (src, dst) in existing_edges:
-                    continue
-                rows.append(src)
-                cols.append(dst)
-                scores.append(score)
+            rows.append(ri)
+            cols.append(ci)
+            scores.append(sv)
 
         if not rows:
+            empty_idx = torch.empty((2, 0), dtype=torch.long, device=device)
+            empty_w = torch.empty((0,), dtype=edge_weight.dtype, device=device)
             return edge_index, edge_weight, {
                 'num_new_edges': 0,
-                'new_edge_index': torch.empty((2, 0), dtype=torch.long, device=device),
-                'new_edge_weight': torch.empty((0,), dtype=edge_weight.dtype, device=device),
+                'new_edge_index': empty_idx,
+                'new_edge_weight': empty_w,
             }
 
+        row = torch.tensor(rows, dtype=torch.long, device=device)
+        col = torch.tensor(cols, dtype=torch.long, device=device)
+        score = torch.tensor(scores, dtype=torch.float32, device=device)
+
+        # 过滤自环
+        if not self.allow_self_loops:
+            mask = row != col
+            row, col, score = row[mask], col[mask], score[mask]
+
+        # 过滤已有边
+        linear_existing = edge_index[0] * num_nodes + edge_index[1]
+        linear_cand = row * num_nodes + col
+        is_existing = torch.isin(linear_cand, linear_existing)
+        mask = ~is_existing
+        if self.score_threshold > 0:
+            mask &= score.abs() >= self.score_threshold
+        else:
+            mask &= score != 0
+
+        row, col, score = row[mask], col[mask], score[mask]
+
+        if row.numel() == 0:
+            empty_idx = torch.empty((2, 0), dtype=torch.long, device=device)
+            empty_w = torch.empty((0,), dtype=edge_weight.dtype, device=device)
+            return edge_index, edge_weight, {
+                'num_new_edges': 0,
+                'new_edge_index': empty_idx,
+                'new_edge_weight': empty_w,
+            }
+
+        # 每节点 top-k
+        if self.top_k_per_node is not None and self.top_k_per_node > 0:
+            k = self.top_k_per_node
+            src_groups = defaultdict(list)  # src -> [(abs_score, score, dst)]
+            for r, c, s in zip(row.tolist(), col.tolist(), score.tolist()):
+                src_groups[r].append((abs(s), s, c))
+
+            new_rows, new_cols, new_scores = [], [], []
+            for r, cand in src_groups.items():
+                cand.sort(reverse=True)
+                for _, s, c in cand[:k]:
+                    new_rows.append(r)
+                    new_cols.append(c)
+                    new_scores.append(s)
+
+            row = torch.tensor(new_rows, dtype=torch.long, device=device)
+            col = torch.tensor(new_cols, dtype=torch.long, device=device)
+            score = torch.tensor(new_scores, dtype=torch.float32, device=device)
+        else:
+            row = row.long()
+            col = col.long()
+
+        # 对称化
         if self.symmetrize:
-            extra_rows = cols.copy()
-            extra_cols = rows.copy()
-            extra_scores = scores.copy()
-            rows.extend(extra_rows)
-            cols.extend(extra_cols)
-            scores.extend(extra_scores)
+            orig_size = row.size(0)
+            row = torch.cat([row, col])
+            col = torch.cat([col, row[:orig_size]])
+            score = torch.cat([score, score[:orig_size]])
 
-        candidate_pairs = set()
-        final_rows = []
-        final_cols = []
-        final_scores = []
+        # 最终去重（防止 symmetrize 后重复）
+        linear = row * num_nodes + col
+        linear, perm = torch.sort(linear)
+        row, col, score = row[perm], col[perm], score[perm]
+        keep = torch.cat([torch.tensor([True], device=device), linear[1:] != linear[:-1]])
+        row, col, score = row[keep], col[keep], score[keep]
 
-        for r, c, s in zip(rows, cols, scores):
-            key = (r, c)
-            if key in existing_edges or key in candidate_pairs:
-                continue
-            if not self.allow_self_loops and r == c:
-                continue
-            candidate_pairs.add(key)
-            final_rows.append(r)
-            final_cols.append(c)
-            final_scores.append(s)
-
-        if not final_rows:
-            return edge_index, edge_weight, {
-                'num_new_edges': 0,
-                'new_edge_index': torch.empty((2, 0), dtype=torch.long, device=device),
-                'new_edge_weight': torch.empty((0,), dtype=edge_weight.dtype, device=device),
-            }
-
-        new_edge_index = torch.tensor([final_rows, final_cols], dtype=torch.long, device=device)
-        score_tensor = torch.tensor(final_scores, dtype=torch.float32, device=device)
-        new_edge_weight = self.score_to_weight(score_tensor)
+        new_edge_weight = self.score_to_weight(score)
+        new_edge_index = torch.stack([row, col])
 
         expanded_edge_index = torch.cat([edge_index, new_edge_index], dim=1)
-        expanded_edge_weight = torch.cat([edge_weight, new_edge_weight], dim=0)
+        expanded_edge_weight = torch.cat([edge_weight, new_edge_weight])
 
         return expanded_edge_index, expanded_edge_weight, {
             'num_new_edges': new_edge_index.size(1),
@@ -296,8 +301,10 @@ class StructuralBalanceExpander:
 
     def score_to_weight(self, scores: Tensor) -> Tensor:
         if self.weighting == 'sign':
-            return torch.where(scores >= 0, torch.ones_like(scores), -torch.ones_like(scores))
-        if self.weighting == 'score':
+            return torch.sign(scores).to(scores.dtype)
+        elif self.weighting == 'score':
             return scores
-        if self.weighting == 'tanh':
+        elif self.weighting == 'tanh':
             return torch.tanh(scores)
+        else:
+            raise ValueError(f"Unknown weighting: {self.weighting}")

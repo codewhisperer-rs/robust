@@ -44,7 +44,7 @@ def main():
     parser = argparse.ArgumentParser()
     # 数据集参数
     parser.add_argument('--data_root', type=str, default='/home/houyikang/data/processed')
-    parser.add_argument('--dataset_name', type=str, default='wiki')
+    parser.add_argument('--dataset_name', type=str, default='bitcoin_alpha',help='可选数据集：bitcoin_otc, bitcoin_alpha, wiki_rfa, slashdot')
     parser.add_argument('--noise_ratio', type=float, default=0)
     parser.add_argument('--unlabeled_ratio', type=float, default=0)
     parser.add_argument('--data_path', type=str, default=None,help='提供该路径，将覆盖自动构建的路径')
@@ -57,7 +57,7 @@ def main():
     parser.add_argument('--temp_end', type=float, default=0.5)
     parser.add_argument('--patience', type=int, default=10)
     parser.add_argument('--fusion', type=str, default='concat', choices=['concat', 'add', 'attention', 'gate'])
-    parser.add_argument('--l1_reg_weight', type=float, default=0.005)
+    parser.add_argument('--l1_reg_weight', type=float, default=0.05)
     parser.add_argument('--label_smoothing', type=float, default=0.0)
     parser.add_argument('--grad_clip_value', type=float, default=1.0)
     parser.add_argument('--model', type=str, default='sdgnn', choices=['sdgnn', 'sgcn'])
@@ -69,14 +69,14 @@ def main():
     parser.add_argument('--sdgnn_no_residual', action='store_true',help='禁用 SDGNN 残差连接')
 
     # 结构平衡扩边参数
-    parser.add_argument('--balance_topk', type=int, default=4,help='结构平衡扩边时每个节点最多保留的新增边数')
-    parser.add_argument('--balance_threshold', type=float, default=0.8,help='扩边得分阈值，低于该阈值的候选边会被忽略')
+    parser.add_argument('--balance_topk', type=int, default=8,help='结构平衡扩边时每个节点最多保留的新增边数')
+    parser.add_argument('--balance_threshold', type=float, default=0.4,help='扩边得分阈值，低于该阈值的候选边会被忽略')
     parser.add_argument('--balance_weighting', type=str, default='sign',choices=['sign', 'score', 'tanh'],help='扩边后新边的权重计算方式')
     parser.add_argument('--balance_symmetrize', action='store_true',help='启用无向图扩边')
-    parser.add_argument('--balance_mode', type=str, default='dense', choices=['dense', 'local'],help='扩边实现：dense 使用矩阵乘法；local 采用局部三角统计（适合大图）')
+    parser.add_argument('--balance_mode', type=str, default='dense', choices=['dense','sparse'],help='扩边实现：dense 使用矩阵乘法；local 采用局部三角统计（适合大图）')
     parser.add_argument('--disable_balance_expansion', action='store_true',help='禁用结构平衡扩边')
 
-    parser.add_argument('--prune_threshold', type=float, default=0.6,help='Gumbel 筛边阶段的权重阈值')
+    parser.add_argument('--prune_threshold', type=float, default=0.3,help='Gumbel 筛边阶段的权重阈值')
     parser.add_argument('--seed', type=int, default=0)
     
     args = parser.parse_args()
